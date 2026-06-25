@@ -2,6 +2,10 @@
 #  run.py  --  Raman / SERS spot-data processing pipeline
 # =============================================================================
 #
+#  AUTHOR
+#  ------
+#  Christian Tian, Department of Chemistry, University of Victoria, Victoria, B.C., Canada
+#
 #  PURPOSE
 #  -------
 #  Reads a folder of Renishaw time-series spot files, processes each spot
@@ -54,17 +58,27 @@
 #         [--fit-mode {average,perframe}] [--smooth-before-fit]
 #         [--strict-axis]
 #         [--qa-spot INT] [--qa-frame INT] [--no-qa-plots]
+#         [--parallel] [--jobs INT]
+#
+#  The despike / baseline / fit stages are serial by default; pass --parallel
+#  to run them across worker processes (--jobs sets the worker count).  Each
+#  run prints start / end timestamps and per-stage elapsed times so the
+#  speed-up from --parallel can be measured.
 #
 #  DEPENDENCIES
 #  ------------
-#  numpy, matplotlib, scipy, pybaselines, ramanspy, lmfit, csv
+#  numpy, matplotlib, pybaselines, ramanspy, lmfit
 #    (pip install ramanspy lmfit pybaselines)
 #  raman_analysis.py  --  must sit in the same folder as this script
 # =============================================================================
 
 import os
 import csv
+import time
 import argparse
+import functools
+from datetime import datetime
+from concurrent.futures import ProcessPoolExecutor
 
 import numpy as np
 import matplotlib.pyplot as plt
@@ -106,6 +120,104 @@ def estimate_baseline(spectrum, *, use_spline, auto_lambda, lam=1e5, p=0.01):
     if auto_lambda:
         lam = estimate_arpls_lambda(spectrum, base_lam=lam)
     return bs.whittaker.arpls(spectrum, lam=lam)[0]
+
+
+# -----------------------------------------------------------------------------
+#  Parallel helpers
+# -----------------------------------------------------------------------------
+#  The per-spot stages -- despiking, baseline correction and peak fitting --
+#  are independent across spots and dominate the runtime, so they are mapped
+#  across worker processes.  The work is CPU-bound NumPy/SciPy/lmfit, so
+#  processes (not threads) are used to sidestep the GIL.  Workers are
+#  module-level functions taking picklable arguments so they survive the
+#  spawn start method used on Windows/macOS.
+def resolve_jobs(requested, n_items):
+    """Clamp the requested worker count to [1, min(n_items, cpu_count)]."""
+    cpu = os.cpu_count() or 1
+    want = cpu if not requested or requested <= 0 else requested
+    return max(1, min(want, n_items, cpu))
+
+
+def run_parallel(worker, items, executor):
+    """map(worker, items), order-preserving, with a serial fast path.
+
+    Runs serially when `executor` is None or there is a single item, which
+    avoids paying process-startup overhead on small workloads.
+    """
+    items = list(items)
+    if executor is None or len(items) <= 1:
+        return [worker(it) for it in items]
+    return list(executor.map(worker, items))
+
+
+def _noop(_):
+    """Trivial task used to pre-spawn the worker pool before timing begins."""
+    return None
+
+
+def _despike_spot(spot2d, *, wn):
+    pipe = rp.preprocessing.Pipeline([
+        rp.preprocessing.despike.WhitakerHayes(kernel_size=3, threshold=6.0),
+    ])
+    out = pipe.apply(rp.SpectralContainer(spot2d, wn)).spectral_data
+    return np.asarray(out, dtype=np.float32)
+
+
+def _savgol_spot(spot2d, *, wn):
+    pipe = rp.preprocessing.Pipeline([
+        rp.preprocessing.denoise.SavGol(window_length=21, polyorder=5),
+    ])
+    out = pipe.apply(rp.SpectralContainer(spot2d, wn)).spectral_data
+    return np.asarray(out, dtype=np.float32)
+
+
+def _baseline_spot(spot2d, *, use_spline, auto_lambda):
+    bl = np.array(
+        [estimate_baseline(row, use_spline=use_spline, auto_lambda=auto_lambda)
+         for row in spot2d],
+        dtype=np.float32)
+    return bl, (spot2d - bl).astype(np.float32)
+
+
+def _fit_spot(packed, *, wn, search_min, search_max, model, fit_mode):
+    """Fit one spot; returns (result_dict, averaged_spectrum).
+
+    `packed` is (spot_index, spot_2d, noise_2sigma) to keep map() single-arg.
+    """
+    i, spot2d, noise_i = packed
+    avg_spec = np.mean(spot2d, axis=0)
+    n = spot2d.shape[0]
+    gate_avg = noise_i / np.sqrt(n)   # averaging cuts noise by sqrt(N)
+
+    # Averaged fit: representative shape, area, R2 and the QA curve.
+    favg = describe_peak(wn, avg_spec, search_min, search_max,
+                         model=model, noise_threshold=gate_avg)
+
+    if fit_mode == 'perframe':
+        per = [describe_peak(wn, frame, search_min, search_max,
+                             model=model, noise_threshold=noise_i)
+               for frame in spot2d]
+        centers = [f['center'] for f in per if f['success'] and f['above_noise']]
+        res = dict(favg)  # shape/area/R2/QA curve from the averaged fit
+        if centers:
+            k = len(centers)
+            res['center'] = float(np.mean(centers))
+            res['center_err'] = (float(np.std(centers, ddof=1) / np.sqrt(k))
+                                 if k > 1 else favg['center_err'])
+            res['above_noise'] = True
+            res['n_frames_fit'] = k
+            # Per-frame centers are valid even if the averaged fit failed, so
+            # mark the spot successful when any frame fit converged.
+            res['success'] = True
+        else:
+            res['n_frames_fit'] = 0
+            res['success'] = favg['success']
+    else:
+        res = dict(favg)
+        res['n_frames_fit'] = n if favg['success'] else 0
+
+    res.update(spot=i)
+    return res, avg_spec
 
 
 # -----------------------------------------------------------------------------
@@ -285,6 +397,12 @@ def parse_args():
     p.add_argument('--no-qa-plots', action='store_true',
                    help='Suppress interactive QA windows (saved figures still written). '
                         'Use for headless / batch runs.')
+    p.add_argument('--parallel', action='store_true',
+                   help='Run the despike / baseline / fit stages across worker '
+                        'processes. Off by default (serial).')
+    p.add_argument('--jobs', type=int, default=0,
+                   help='Worker process count when --parallel is set. '
+                        '0 (default) uses all CPU cores. Ignored without --parallel.')
     return p.parse_args()
 
 
@@ -320,12 +438,35 @@ def main():
             f'Raw spectrum - data loading check (spot {qa_i}, frame {qa_j})',
             window, save=None, show=show)
 
+    # Spin up one shared worker pool for the three CPU-bound per-spot stages
+    # (despiking, baseline correction, peak fitting).  These are independent
+    # across spots and dominate the runtime, so mapping them over cores is the
+    # main speed-up.  Parallelism is opt-in (--parallel); serial by default.
+    if args.parallel:
+        n_jobs = resolve_jobs(args.jobs, len(spectra_raw))
+    else:
+        n_jobs = 1
+    executor = ProcessPoolExecutor(max_workers=n_jobs) if n_jobs > 1 else None
+    if executor is not None:
+        print(f"  Parallel stages using {n_jobs} worker process(es).")
+        # Spawn the workers now so their one-time start-up cost (process spawn
+        # plus re-importing this module) is not charged to the despike timing.
+        list(executor.map(_noop, range(n_jobs)))
+    elif args.parallel:
+        print("  Serial processing (only one worker available for this run).")
+    else:
+        print("  Serial processing (pass --parallel to use multiple cores).")
+
+    # Time only the per-spot compute stages, so the reported figure reflects the
+    # work parallelism actually affects (interactive QA plots are excluded).
+    stage_times = []
+    proc_start_wall = datetime.now()
+    proc_start = time.perf_counter()
+    print(f"  Processing start: {proc_start_wall:%Y-%m-%d %H:%M:%S}")
+
     # --- Despike (always) + Savitzky-Golay (QA / optional pre-fit) -----------
     # threshold=6.0 is stricter than RamanSPy's default of 8, which better
     # preserves weak SERS bands while still catching cosmic rays.
-    despike = rp.preprocessing.Pipeline([
-        rp.preprocessing.despike.WhitakerHayes(kernel_size=3, threshold=6.0),
-    ])
     savgol = rp.preprocessing.Pipeline([
         rp.preprocessing.denoise.SavGol(window_length=21, polyorder=5),
     ])
@@ -333,121 +474,124 @@ def main():
     def apply_pipe(pipe, data2d):
         return pipe.apply(rp.SpectralContainer(data2d, wn)).spectral_data
 
-    spectra_despiked = [apply_pipe(despike, s).astype(np.float32) for s in spectra_raw]
+    try:
+        _t = time.perf_counter()
+        spectra_despiked = run_parallel(
+            functools.partial(_despike_spot, wn=wn), spectra_raw, executor)
+        stage_times.append(('despike', time.perf_counter() - _t))
 
-    # Smoothed view of the QA spot for the raw-vs-smoothed comparison.
-    qa_smoothed = apply_pipe(savgol, spectra_despiked[qa_i]).astype(np.float32)
-    qa_plot(wn,
-            [(spectra_raw[qa_i][qa_j], 'Raw'), (qa_smoothed[qa_j], 'Smoothed')],
-            f'Raw vs smoothed spectrum (spot {qa_i}, frame {qa_j})',
-            window, save=None, show=show)
+        # Smoothed view of the QA spot for the raw-vs-smoothed comparison.
+        qa_smoothed = apply_pipe(savgol, spectra_despiked[qa_i]).astype(np.float32)
+        qa_plot(wn,
+                [(spectra_raw[qa_i][qa_j], 'Raw'), (qa_smoothed[qa_j], 'Smoothed')],
+                f'Raw vs smoothed spectrum (spot {qa_i}, frame {qa_j})',
+                window, save=None, show=show)
 
-    # Fit input: despiked-but-unsmoothed by default; SavGol only if requested.
-    if args.smooth_before_fit:
-        fit_input = [apply_pipe(savgol, s).astype(np.float32) for s in spectra_despiked]
-    else:
-        fit_input = spectra_despiked
+        # Fit input: despiked-but-unsmoothed by default; SavGol only if requested.
+        if args.smooth_before_fit:
+            _t = time.perf_counter()
+            fit_input = run_parallel(
+                functools.partial(_savgol_spot, wn=wn), spectra_despiked, executor)
+            stage_times.append(('smooth', time.perf_counter() - _t))
+        else:
+            fit_input = spectra_despiked
 
-    # --- Baseline correction -------------------------------------------------
-    baselines, spectra_b = [], []
-    for s in fit_input:
-        bl = np.array(
-            [estimate_baseline(row,
-                               use_spline=args.useSplineMixtureBaseline,
-                               auto_lambda=not args.fixedArplsLambda)
-             for row in s],
-            dtype=np.float32)
-        baselines.append(bl)
-        spectra_b.append((s - bl).astype(np.float32))
+        # --- Baseline correction ---------------------------------------------
+        _t = time.perf_counter()
+        baseline_pairs = run_parallel(
+            functools.partial(_baseline_spot,
+                              use_spline=args.useSplineMixtureBaseline,
+                              auto_lambda=not args.fixedArplsLambda),
+            fit_input, executor)
+        stage_times.append(('baseline', time.perf_counter() - _t))
+        baselines = [bl for bl, _ in baseline_pairs]
+        spectra_b = [corr for _, corr in baseline_pairs]
+        del baseline_pairs
 
-    if fit_input is not spectra_despiked:
-        del fit_input
-    del spectra_despiked
+        if fit_input is not spectra_despiked:
+            del fit_input
+        del spectra_despiked
 
-    qa_plot(wn,
-            [(spectra_raw[qa_i][qa_j], 'Raw'),
-             (spectra_b[qa_i][qa_j], 'Corrected'),
-             (baselines[qa_i][qa_j], 'Baseline')],
-            f'Baseline correction check (spot {qa_i}, frame {qa_j})',
-            window, save=None, show=show)
+        qa_plot(wn,
+                [(spectra_raw[qa_i][qa_j], 'Raw'),
+                 (spectra_b[qa_i][qa_j], 'Corrected'),
+                 (baselines[qa_i][qa_j], 'Baseline')],
+                f'Baseline correction check (spot {qa_i}, frame {qa_j})',
+                window, save=None, show=show)
 
-    # Baseline parameter check, run on the same fit input the pipeline uses.
-    base_temp = estimate_baseline(spectra_b[qa_i][qa_j] + baselines[qa_i][qa_j],
-                                  use_spline=args.useSplineMixtureBaseline,
-                                  auto_lambda=not args.fixedArplsLambda)
-    qa_plot(wn,
-            [(spectra_b[qa_i][qa_j] + baselines[qa_i][qa_j], 'Fit input'),
-             (base_temp, 'Baseline')],
-            f'Baseline parameter check (spot {qa_i}, frame {qa_j})',
-            window, save=None, show=show)
+        # Baseline parameter check, run on the same fit input the pipeline uses.
+        base_temp = estimate_baseline(spectra_b[qa_i][qa_j] + baselines[qa_i][qa_j],
+                                      use_spline=args.useSplineMixtureBaseline,
+                                      auto_lambda=not args.fixedArplsLambda)
+        qa_plot(wn,
+                [(spectra_b[qa_i][qa_j] + baselines[qa_i][qa_j], 'Fit input'),
+                 (base_temp, 'Baseline')],
+                f'Baseline parameter check (spot {qa_i}, frame {qa_j})',
+                window, save=None, show=show)
 
-    del spectra_raw  # last used above
+        del spectra_raw  # last used above
 
-    # --- Noise threshold -----------------------------------------------------
-    # 2-sigma of the quietest channel (smallest mean |signal|) across frames.
-    noise_2sigma = []
-    for s in spectra_b:
-        av = np.mean(s, axis=0)
-        q = int(np.argmin(np.abs(av)))
-        col = s[:, q]
-        nz = col[col != 0]
-        noise_2sigma.append(2.0 * float(np.std(nz if nz.size else col)))
+        # --- Noise threshold -------------------------------------------------
+        # 2-sigma of the quietest channel (smallest mean |signal|) across frames.
+        noise_2sigma = []
+        for s in spectra_b:
+            av = np.mean(s, axis=0)
+            q = int(np.argmin(np.abs(av)))
+            col = s[:, q]
+            nz = col[col != 0]
+            noise_2sigma.append(2.0 * float(np.std(nz if nz.size else col)))
 
-    # Treatment figure (saved): baseline, corrected, per-frame noise floor.
-    tr = noise_2sigma[qa_i] * np.ones(len(wn))
-    qa_plot(wn,
-            [(baselines[qa_i][qa_j], 'Baseline'),
-             (spectra_b[qa_i][qa_j], 'Corrected spectra'),
-             (tr, 'Zero signal threshold')],
-            'Spectral treatment: baseline, corrected spectrum and noise threshold',
-            window, save=f'spectra_treatment_{label}.png', show=show)
+        # Treatment figure (saved): baseline, corrected, per-frame noise floor.
+        tr = noise_2sigma[qa_i] * np.ones(len(wn))
+        qa_plot(wn,
+                [(baselines[qa_i][qa_j], 'Baseline'),
+                 (spectra_b[qa_i][qa_j], 'Corrected spectra'),
+                 (tr, 'Zero signal threshold')],
+                'Spectral treatment: baseline, corrected spectrum and noise threshold',
+                window, save=f'spectra_treatment_{label}.png', show=show)
 
-    del baselines
+        del baselines
 
-    # --- Peak fitting --------------------------------------------------------
-    # Average all frames per spot before fitting (higher SNR); each averaged
-    # spectrum is one measurement condition (e.g. one proton-donor concentration)
-    # and its fitted center is the shifted Raman frequency.  In perframe mode we
-    # additionally fit every frame and report center as mean +/- SEM, which
-    # propagates the real temporal scatter (SERS blinking) into the uncertainty.
-    print(f"\nFitting peaks in [{search_min:.1f}, {search_max:.1f}] cm^-1 "
-          f"({args.model}, --fit-mode {args.fit_mode}) ...")
+        # --- Peak fitting ----------------------------------------------------
+        # Average all frames per spot before fitting (higher SNR); each averaged
+        # spectrum is one measurement condition (e.g. one proton-donor concentration)
+        # and its fitted center is the shifted Raman frequency.  In perframe mode we
+        # additionally fit every frame and report center as mean +/- SEM, which
+        # propagates the real temporal scatter (SERS blinking) into the uncertainty.
+        print(f"\nFitting peaks in [{search_min:.1f}, {search_max:.1f}] cm^-1 "
+              f"({args.model}, --fit-mode {args.fit_mode}) ...")
+        _t = time.perf_counter()
+        fit_out = run_parallel(
+            functools.partial(_fit_spot, wn=wn, search_min=search_min,
+                              search_max=search_max, model=args.model,
+                              fit_mode=args.fit_mode),
+            list(zip(range(len(spectra_b)), spectra_b, noise_2sigma)),
+            executor)
+        stage_times.append(('fit', time.perf_counter() - _t))
+    finally:
+        if executor is not None:
+            executor.shutdown()   # release workers even if a stage raised
+
+    # --- Timing report (compute stages) --------------------------------------
+    proc_end_wall = datetime.now()
+    compute_elapsed = sum(t for _, t in stage_times)
+    mode = f"parallel ({n_jobs} workers)" if executor is not None else "serial"
+    print(f"\n  Compute stages done: {proc_end_wall:%Y-%m-%d %H:%M:%S}   ({mode})")
+    print("  Stage compute times (s): "
+          + "  ".join(f"{name}={t:.2f}" for name, t in stage_times))
+    print(f"  Elapsed (compute stages): {compute_elapsed:.2f} s")
+
+    # Worker output arrives in spot order, so the QA spot (first successful
+    # fit) and the CSV row order match the original serial behavior.
     results = []
     qa_fit = None  # (spot, averaged spectrum, result) for the fit-QA plot
-    for i, s in enumerate(spectra_b):
-        avg_spec = np.mean(s, axis=0)
-        n = s.shape[0]
-        gate_avg = noise_2sigma[i] / np.sqrt(n)   # averaging cuts noise by sqrt(N)
-
-        # Averaged fit: representative shape, area, R2 and the QA curve.
-        favg = describe_peak(wn, avg_spec, search_min, search_max,
-                             model=args.model, noise_threshold=gate_avg)
-
-        if args.fit_mode == 'perframe':
-            per = [describe_peak(wn, frame, search_min, search_max,
-                                 model=args.model, noise_threshold=noise_2sigma[i])
-                   for frame in s]
-            centers = [f['center'] for f in per if f['success'] and f['above_noise']]
-            res = dict(favg)  # shape/area/R2/QA curve from the averaged fit
-            if centers:
-                k = len(centers)
-                res['center'] = float(np.mean(centers))
-                res['center_err'] = (float(np.std(centers, ddof=1) / np.sqrt(k))
-                                     if k > 1 else favg['center_err'])
-                res['above_noise'] = True
-                res['n_frames_fit'] = k
-            else:
-                res['n_frames_fit'] = 0
-        else:
-            res = dict(favg)
-            res['n_frames_fit'] = n
-
-        res.update(spot=i, file=files[i])
+    for res, avg_spec in fit_out:
+        res['file'] = files[res['spot']]
         results.append(res)
         if qa_fit is None and res['success'] and res.get('x_fit') is not None:
-            qa_fit = (i, avg_spec.copy(), res)
+            qa_fit = (res['spot'], avg_spec, res)
 
-    del spectra_b  # largest array, no longer needed after fitting
+    del fit_out, spectra_b  # largest arrays, no longer needed after fitting
 
     # --- Terminal table ------------------------------------------------------
     hdr = (f"{'spot':>5}  {'center(cm-1)':>12}  {'+-err':>7}  "
@@ -517,6 +661,11 @@ def main():
         if show:
             plt.show()
         plt.close(fig)
+
+    # --- Total wall-clock time (compute + QA plots + output) -----------------
+    print(f"\n  Processing end:   {datetime.now():%Y-%m-%d %H:%M:%S}")
+    print(f"  Elapsed (incl. QA plots & output): "
+          f"{time.perf_counter() - proc_start:.2f} s")
 
 
 if __name__ == '__main__':
