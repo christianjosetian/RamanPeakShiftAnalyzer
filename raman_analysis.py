@@ -1,5 +1,7 @@
 """raman_analysis.py -- Raman/SERS spot-data helpers.
 
+Author: Christian Tian, Department of Chemistry, University of Victoria
+
 Slimmed to the two functions used by run.py:
 
     read_tseries_renishaw(file_path) -> (wn, signal)
@@ -79,14 +81,14 @@ def describe_peak(wn, sig, search_min, search_max, model='lorentzian',
     search_min, search_max : float
         Wavenumber bounds of the fit window.  Make it wide enough to contain the
         band across every concentration, but narrow enough to isolate this band
-        from its neighbours.
+        from its neighbors.
     model : {'lorentzian', 'gaussian', 'voigt'}
         Line shape.  'lorentzian' is the usual Raman default; 'voigt' adds
         Gaussian (instrument) broadening; 'gaussian' is also available.
     noise_threshold : float, optional
         If given, the fitted peak `height` is compared against this value (the
         spot's noise floor) and reported via `above_noise`.  When None, no
-        judgement is made and `above_noise` defaults to True.
+        judgment is made and `above_noise` defaults to True.
 
     Returns
     -------
@@ -135,7 +137,7 @@ def describe_peak(wn, sig, search_min, search_max, model='lorentzian',
 
     try:
         # Seed parameters from the data, then constrain them physically and keep
-        # the centre inside the search window.  Guesses are clamped to the bounds
+        # the center inside the search window.  Guesses are clamped to the bounds
         # so lmfit never rejects an out-of-range starting value.
         params = peak.guess(y, x=x)
         params['amplitude'].set(value=max(float(params['amplitude'].value), 1e-12), min=0)
