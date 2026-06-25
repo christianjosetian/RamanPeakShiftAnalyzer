@@ -23,12 +23,46 @@ a script needs them.
 import numpy as np
 
 
-def read_tseries_renishaw(file_path):
+def _first_data_ncols(file_path):
+    """Number of columns on the first non-comment data row of a Renishaw export.
+
+    Reads only the header rather than the whole file, so the dispatcher can
+    pick a format-specific reader before paying for a full np.loadtxt.
+    """
+    with open(file_path) as fh:
+        for line in fh:
+            stripped = line.strip()
+            if stripped and not stripped.startswith('#'):
+                return len(stripped.split())
+    raise ValueError(f"{file_path}: no data rows found -- file is empty or all-comment.")
+
+
+def _read_renishaw_blocks(file_path, wn_col, int_col, *, unit='frame'):
+    """Parse a block-structured Renishaw ASCII export into (wn, signal).
+
+    Shared core for the time-series and map readers: the two layouts differ
+    only in WHICH columns hold the wavenumber and intensity, and in what each
+    block represents (a time frame vs. a spatial position -- `unit`, used only
+    in error messages).  Each spectrum is one contiguous run of `n_wn` rows.
+
+    Returns
+    -------
+    wn : 1-D float array
+        The common wavenumber axis (cm^-1).
+    signal : (n_blocks, n_wn) float32 array
+        One row per block (frame or position), aligned to `wn`.
+    """
     data = np.loadtxt(file_path)
-    wn = np.unique(data[:, 1])
+    if data.ndim != 2 or data.shape[1] <= max(wn_col, int_col):
+        raise ValueError(
+            f"{file_path}: expected at least {max(wn_col, int_col) + 1} columns "
+            f"(got shape {data.shape}) -- not a recognized Renishaw export."
+        )
+
+    wn = np.unique(data[:, wn_col])
     n_wn = len(wn)
 
-    # Validate the file is a whole number of equal-length frames.  A truncated or
+    # Validate the file is a whole number of equal-length blocks.  A truncated or
     # malformed export would otherwise be silently reshaped, misaligning every
     # downstream spectrum with no error raised.
     if n_wn == 0 or len(data) % n_wn != 0:
@@ -36,24 +70,61 @@ def read_tseries_renishaw(file_path):
             f"{file_path}: {len(data)} rows is not an integer multiple of "
             f"{n_wn} unique wavenumbers -- file may be truncated or malformed."
         )
-    n_time = len(data) // n_wn
+    n_blocks = len(data) // n_wn
 
-    # The first frame's wavenumber grid must match the global axis; if it
-    # doesn't, the frames were not sampled on a consistent grid.
-    if not np.allclose(np.sort(data[:n_wn, 1]), wn, rtol=0.0, atol=1e-6):
+    # The first block's wavenumber grid must match the global axis; if it
+    # doesn't, the spectra were not sampled on a consistent grid.
+    if not np.allclose(np.sort(data[:n_wn, wn_col]), wn, rtol=0.0, atol=1e-6):
         raise ValueError(
-            f"{file_path}: per-frame wavenumber grid does not match the "
+            f"{file_path}: per-{unit} wavenumber grid does not match the "
             f"global axis -- inconsistent sampling."
         )
 
-    signal = np.empty((n_time, n_wn), dtype=np.float32)
-    for i in range(n_time):
+    signal = np.empty((n_blocks, n_wn), dtype=np.float32)
+    for i in range(n_blocks):
         block = data[i * n_wn:(i + 1) * n_wn]
-        # Sort each frame by its own wavenumber column so the intensities line
+        # Sort each block by its own wavenumber column so the intensities line
         # up with `wn`, whatever order the file stored them in.
-        order = np.argsort(block[:, 1])
-        signal[i] = block[order, 2]
+        order = np.argsort(block[:, wn_col])
+        signal[i] = block[order, int_col]
     return wn, signal
+
+
+def read_tseries_renishaw(file_path):
+    """Read a 3-column Renishaw TIME-SERIES export: index, Wave, Intensity.
+
+    Each block is one time frame; returns (wn, signal) with signal shaped
+    (n_frames, n_wavenumbers).
+    """
+    return _read_renishaw_blocks(file_path, wn_col=1, int_col=2, unit='frame')
+
+
+def read_map_renishaw(file_path):
+    """Read a 4-column Renishaw MAP export: X, Y, Wave, Intensity.
+
+    Each block is one spatial position; returns (wn, signal) with signal shaped
+    (n_positions, n_wavenumbers) so a map drops straight into the same
+    frame-based pipeline (each map point is treated as a frame).
+    """
+    return _read_renishaw_blocks(file_path, wn_col=2, int_col=3, unit='position')
+
+
+def read_renishaw_spots(file_path):
+    """Read a Renishaw export, dispatching on its column layout.
+
+    3 columns -> time series (read_tseries_renishaw); 4+ columns -> spatial map
+    (read_map_renishaw).  Both return the same (wn, signal) shape, so callers
+    handle either acquisition mode transparently.
+    """
+    ncols = _first_data_ncols(file_path)
+    if ncols >= 4:
+        return read_map_renishaw(file_path)
+    if ncols == 3:
+        return read_tseries_renishaw(file_path)
+    raise ValueError(
+        f"{file_path}: {ncols} data columns -- expected 3 (time series) "
+        f"or 4 (map). Not a recognized Renishaw export."
+    )
 
 
 def describe_peak(wn, sig, search_min, search_max, model='lorentzian',

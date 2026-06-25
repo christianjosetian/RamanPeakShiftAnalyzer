@@ -86,7 +86,7 @@ from matplotlib.ticker import AutoMinorLocator
 import pybaselines as bs
 import ramanspy as rp
 
-from raman_analysis import read_tseries_renishaw, describe_peak
+from raman_analysis import read_renishaw_spots, describe_peak
 
 
 # -----------------------------------------------------------------------------
@@ -180,12 +180,17 @@ def _baseline_spot(spot2d, *, use_spline, auto_lambda):
 
 
 def _fit_spot(packed, *, wn, search_min, search_max, model, fit_mode):
-    """Fit one spot; returns (result_dict, averaged_spectrum).
+    """Fit one spot; returns (result_dict, averaged_spectrum, lo_env, hi_env).
 
     `packed` is (spot_index, spot_2d, noise_2sigma) to keep map() single-arg.
+    `lo_env`/`hi_env` are the per-wavenumber min/max across the spot's frames
+    (the 77 map positions), so a plot can show how consistent the positions are
+    around the average as a shaded min-max band.
     """
     i, spot2d, noise_i = packed
     avg_spec = np.mean(spot2d, axis=0)
+    lo_env = np.min(spot2d, axis=0)   # quietest position at each wavenumber
+    hi_env = np.max(spot2d, axis=0)   # loudest position at each wavenumber
     n = spot2d.shape[0]
     gate_avg = noise_i / np.sqrt(n)   # averaging cuts noise by sqrt(N)
 
@@ -217,7 +222,7 @@ def _fit_spot(packed, *, wn, search_min, search_max, model, fit_mode):
         res['n_frames_fit'] = n if favg['success'] else 0
 
     res.update(spot=i)
-    return res, avg_spec
+    return res, avg_spec, lo_env, hi_env
 
 
 # -----------------------------------------------------------------------------
@@ -330,7 +335,7 @@ def load_spots(data_dir, *, trim=3, resample=True):
     for fname in txts:
         path = os.path.join(data_dir, fname)
         try:
-            wn_raw, signal = read_tseries_renishaw(path)
+            wn_raw, signal = read_renishaw_spots(path)
         except Exception as exc:
             print(f"  [skip] {fname}: {exc}")
             continue
@@ -435,7 +440,7 @@ def main():
     window = (search_min, search_max)
 
     qa_plot(wn, [(spectra_raw[qa_i][qa_j], 'Raw')],
-            f'Raw spectrum - data loading check (spot {qa_i}, frame {qa_j})',
+            f'Plot 1: Raw spectrum - data loading check (spot {qa_i}, frame {qa_j})',
             window, save=None, show=show)
 
     # Spin up one shared worker pool for the three CPU-bound per-spot stages
@@ -484,7 +489,7 @@ def main():
         qa_smoothed = apply_pipe(savgol, spectra_despiked[qa_i]).astype(np.float32)
         qa_plot(wn,
                 [(spectra_raw[qa_i][qa_j], 'Raw'), (qa_smoothed[qa_j], 'Smoothed')],
-                f'Raw vs smoothed spectrum (spot {qa_i}, frame {qa_j})',
+                f'Plot 2: Raw vs smoothed spectrum (spot {qa_i}, frame {qa_j})',
                 window, save=None, show=show)
 
         # Fit input: despiked-but-unsmoothed by default; SavGol only if requested.
@@ -516,7 +521,7 @@ def main():
                 [(spectra_raw[qa_i][qa_j], 'Raw'),
                  (spectra_b[qa_i][qa_j], 'Corrected'),
                  (baselines[qa_i][qa_j], 'Baseline')],
-                f'Baseline correction check (spot {qa_i}, frame {qa_j})',
+                f'Plot 3: Baseline correction check (spot {qa_i}, frame {qa_j})',
                 window, save=None, show=show)
 
         # Baseline parameter check, run on the same fit input the pipeline uses.
@@ -526,7 +531,7 @@ def main():
         qa_plot(wn,
                 [(spectra_b[qa_i][qa_j] + baselines[qa_i][qa_j], 'Fit input'),
                  (base_temp, 'Baseline')],
-                f'Baseline parameter check (spot {qa_i}, frame {qa_j})',
+                f'Plot 4: Baseline parameter check (spot {qa_i}, frame {qa_j})',
                 window, save=None, show=show)
 
         del spectra_raw  # last used above
@@ -547,7 +552,7 @@ def main():
                 [(baselines[qa_i][qa_j], 'Baseline'),
                  (spectra_b[qa_i][qa_j], 'Corrected spectra'),
                  (tr, 'Zero signal threshold')],
-                'Spectral treatment: baseline, corrected spectrum and noise threshold',
+                'Plot 5: Spectral treatment: baseline, corrected spectrum and noise threshold',
                 window, save=f'spectra_treatment_{label}.png', show=show)
 
         del baselines
@@ -581,15 +586,15 @@ def main():
           + "  ".join(f"{name}={t:.2f}" for name, t in stage_times))
     print(f"  Elapsed (compute stages): {compute_elapsed:.2f} s")
 
-    # Worker output arrives in spot order, so the QA spot (first successful
-    # fit) and the CSV row order match the original serial behavior.
+    # Worker output arrives in spot order, so the CSV row order and the per-spot
+    # QA figures match the original serial behavior.
     results = []
-    qa_fit = None  # (spot, averaged spectrum, result) for the fit-QA plot
-    for res, avg_spec in fit_out:
+    qa_fits = []  # (spot, avg, lo_env, hi_env, result) per successful spot
+    for res, avg_spec, lo_env, hi_env in fit_out:
         res['file'] = files[res['spot']]
         results.append(res)
-        if qa_fit is None and res['success'] and res.get('x_fit') is not None:
-            qa_fit = (res['spot'], avg_spec, res)
+        if res['success'] and res.get('x_fit') is not None:
+            qa_fits.append((res['spot'], avg_spec, lo_env, hi_env, res))
 
     del fit_out, spectra_b  # largest arrays, no longer needed after fitting
 
@@ -620,10 +625,19 @@ def main():
     print(f"\n  Saved: {csv_path}")
 
     # --- Plot 1: fit-quality check (true fitted curve, no reconstruction) ----
-    if qa_fit is not None:
-        qa_spot, qa_spec, r_qa = qa_fit
-        mask = (wn >= search_min) & (wn <= search_max)
+    # One figure per spot: averaged spectrum, the true fitted curve, and the
+    # min-max band across that spot's positions.  Saved so every spot is kept.
+    # Figures are built first and shown together at the end, so all spot windows
+    # appear at once instead of blocking one-at-a-time on each plt.show().
+    mask = (wn >= search_min) & (wn <= search_max)
+    qa_figs = []
+    for qa_spot, qa_spec, qa_lo, qa_hi, r_qa in qa_fits:
         fig, ax = plt.subplots(figsize=(7, 4.5))
+        # Min-max envelope across the spot's positions: a wide band means the
+        # positions disagree, a tight band means the average is representative.
+        ax.fill_between(wn[mask], qa_lo[mask], qa_hi[mask],
+                        color='steelblue', alpha=0.20,
+                        label='Min-max across positions')
         ax.plot(wn[mask], qa_spec[mask], label='Averaged spectrum')
         ax.plot(r_qa['x_fit'], r_qa['y_fit'], '--',
                 label=f"Fitted {r_qa['model']}  R$^2$={r_qa['r_squared']:.4f}")
@@ -631,13 +645,20 @@ def main():
                    label=f"Center {r_qa['center']:.2f} cm$^{{-1}}$")
         ax.set_xlabel('Raman shift / cm$^{-1}$')
         ax.set_ylabel('Counts / arb. units')
-        ax.set_title(f"Fit QA - spot {qa_spot}  ({r_qa['file']})")
+        ax.set_title(f"Plot 6: Fit QA - spot {qa_spot}  ({r_qa['file']})")
         ax.locator_params(axis='x', nbins=8)
         ax.xaxis.set_minor_locator(AutoMinorLocator(5))
         ax.yaxis.set_minor_locator(AutoMinorLocator(3))
         ax.legend()
-        if show:
-            plt.show()
+        qa_path = f'fit_qa_{label}_spot{qa_spot}.png'
+        plt.savefig(qa_path, dpi=800)
+        print(f"\n  Saved: {qa_path}")
+        qa_figs.append(fig)
+
+    # Show every spot's figure together (one blocking call), then close them all.
+    if show and qa_figs:
+        plt.show()
+    for fig in qa_figs:
         plt.close(fig)
 
     # --- Plot 2: fitted center per spot (the shift result) -------------------
@@ -653,7 +674,7 @@ def main():
         ax.errorbar(s_vals, c_vals, yerr=e_vals, fmt='o-', capsize=4)
         ax.set_xlabel('Spot')
         ax.set_ylabel('Peak center / cm$^{-1}$')
-        ax.set_title('Fitted peak frequency per spot')
+        ax.set_title('Plot 7: Fitted peak frequency per spot')
         ax.locator_params(axis='x', nbins=min(len(s_vals), 10))
         ax.yaxis.set_minor_locator(AutoMinorLocator(3))
         plt.savefig(f'peak_centers_{label}.png', dpi=800)
