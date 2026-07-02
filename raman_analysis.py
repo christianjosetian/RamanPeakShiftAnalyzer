@@ -2,11 +2,13 @@
 
 Author: Christian Tian, Department of Chemistry, University of Victoria
 
-Slimmed to the two functions used by run.py:
+Public functions used by run.py:
 
-    read_tseries_renishaw(file_path) -> (wn, signal)
-        Read a Renishaw ASCII time-series export into a wavenumber axis and
-        a (n_frames, n_wavenumbers) float32 array.
+    read_renishaw_spots(file_path) -> (wn, signal)
+        Read a Renishaw ASCII export, dispatching on the column layout to
+        read_tseries_renishaw (3-column time series) or read_map_renishaw
+        (4-column map).  Both return a wavenumber axis and a
+        (n_frames, n_wavenumbers) float32 array.
 
     describe_peak(wn, sig, search_min, search_max, model='lorentzian',
                   noise_threshold=None) -> dict
@@ -14,10 +16,6 @@ Slimmed to the two functions used by run.py:
         center / center_err / FWHM / height / area / R-squared / AIC / BIC,
         the fitted curve (x_fit, y_fit), plus an above_noise flag when a
         noise threshold is supplied.
-
-Other helpers (Lumerical/FDTD fitting, FFT correlation, violin plots, map and
-spot readers, plotting helpers) live in raman_legacy.py -- import from there if
-a script needs them.
 """
 
 import numpy as np
