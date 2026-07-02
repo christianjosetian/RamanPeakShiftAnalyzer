@@ -8,25 +8,30 @@
 #
 #  PURPOSE
 #  -------
-#  Reads a folder of Renishaw time-series spot files, processes each spot
-#  through a full spectral pipeline, and writes peak measurements to disk.
+#  Reads a folder of Renishaw spot files (time-series or map exports),
+#  processes each spot through a full spectral pipeline, and writes peak
+#  measurements to disk.
 #  Designed for SERS substrate evaluation: signal intensity fluctuates over
 #  time at each spot, and peak frequency may shift with a control variable
 #  (e.g. proton-donor concentration).
 #
 #  INPUT
 #  -----
-#  A directory of Renishaw ASCII time-series exports.  Each file is one
-#  measurement spot.  read_tseries_renishaw() (raman_analysis.py) returns
-#  the wavenumber axis and a 2-D array shaped (n_frames, n_wavenumbers).
+#  A directory of Renishaw ASCII exports.  Each file is one measurement spot,
+#  either a time-series (3-column) or a spatial map (4-column) export.
+#  read_renishaw_spots() (raman_analysis.py) dispatches on the column layout
+#  and returns the wavenumber axis and a 2-D array shaped
+#  (n_frames, n_wavenumbers) -- map positions are treated as frames.
 #  The first 3 edge points of each spectrum are trimmed on load.  Files whose
 #  wavenumber axis differs from the first spot are resampled onto the common
 #  grid (use --strict-axis to reject them instead).
 #
 #  PROCESSING PIPELINE  (applied per spot)
 #  ----------------------------------------
-#  1. Cosmic-ray removal  Whitaker-Hayes modified z-score despiking (RamanSPy)
-#  2. Smoothing           Savitzky-Golay, window 21, order 5 (RamanSPy) -- used
+#  1. Cosmic-ray removal  Whitaker-Hayes modified z-score despiking (local
+#                         implementation; the variant in RamanSPy 0.2.10 has
+#                         bugs -- see its issue #19).
+#  2. Smoothing           Savitzky-Golay, window 21, order 5 (scipy) -- used
 #                         for QA display by default; only applied BEFORE fitting
 #                         when --smooth-before-fit is set.
 #  3. Baseline removal    arPLS by default (fast); spline mixture model
@@ -38,16 +43,19 @@
 #  5. Peak fitting        Lorentzian (default) / Gaussian / Voigt via
 #                         describe_peak() (lmfit) over a search window; returns
 #                         center, FWHM, height, area, R2, AIC/BIC and the
-#                         above_noise flag.  --fit-mode average (default) fits
-#                         the per-spot averaged spectrum; --fit-mode perframe
-#                         fits every frame and reports center as mean +/- SEM
-#                         (a more honest uncertainty for blinking SERS signals).
+#                         above_noise flag.  --fit-mode perframe (default) fits
+#                         every frame and combines the per-frame centers with a
+#                         robust estimator (--center-agg trimmed by default),
+#                         taking shape/area/R2 from the per-spot averaged
+#                         spectrum; --fit-mode average fits only the averaged
+#                         spectrum (faster, less accurate center).
 #
 #  OUTPUT FILES  (written to the working directory)
 #  ------------------------------------------------
-#  spectra_treatment_<label>.png  QA figure: baseline, corrected, threshold
-#  peak_fits_<label>.csv          per-spot fit results
-#  peak_centers_<label>.png       fitted center per spot with error bars
+#  spectra_treatment_<label>.png   QA figure: baseline, corrected, threshold
+#  fit_qa_<label>_spot<N>.png      per-spot fit-quality figure (one per fitted spot)
+#  peak_fits_<label>.csv           per-spot fit results
+#  peak_centers_<label>.png        fitted center per spot with error bars
 #
 #  COMMAND-LINE USAGE
 #  ------------------
@@ -55,7 +63,9 @@
 #         [--label STR] [--model {lorentzian,gaussian,voigt}]
 #         [--useSplineMixtureBaseline] [--fixedArplsLambda]
 #         [--peak-min FLOAT] [--peak-max FLOAT]
-#         [--fit-mode {average,perframe}] [--smooth-before-fit]
+#         [--fit-mode {average,perframe}]
+#         [--center-agg {mean,median,trimmed}] [--trim-fraction FLOAT]
+#         [--smooth-before-fit]
 #         [--strict-axis]
 #         [--qa-spot INT] [--qa-frame INT] [--no-qa-plots]
 #         [--parallel] [--jobs INT]
@@ -67,8 +77,8 @@
 #
 #  DEPENDENCIES
 #  ------------
-#  numpy, matplotlib, pybaselines, ramanspy, lmfit
-#    (pip install ramanspy lmfit pybaselines)
+#  numpy, scipy, matplotlib, pybaselines, lmfit
+#    (pip install numpy scipy matplotlib pybaselines lmfit)
 #  raman_analysis.py  --  must sit in the same folder as this script
 # =============================================================================
 
@@ -83,8 +93,8 @@ from concurrent.futures import ProcessPoolExecutor
 import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.ticker import AutoMinorLocator
+from scipy.signal import savgol_filter
 import pybaselines as bs
-import ramanspy as rp
 
 from raman_analysis import read_renishaw_spots, describe_peak
 
@@ -106,7 +116,7 @@ def estimate_arpls_lambda(spectrum, base_lam=1e5, reference_noise_ratio=0.008,
     return float(np.clip(lam, min_lam, max_lam))
 
 
-def estimate_baseline(spectrum, *, use_spline, auto_lambda, lam=1e5, p=0.01):
+def estimate_baseline(spectrum, *, use_spline, auto_lambda, lam=1e5):
     """Baseline for ONE spectrum.
 
     Configuration is passed in explicitly rather than read from globals.
@@ -155,20 +165,77 @@ def _noop(_):
     return None
 
 
-def _despike_spot(spot2d, *, wn):
-    pipe = rp.preprocessing.Pipeline([
-        rp.preprocessing.despike.WhitakerHayes(kernel_size=3, threshold=6.0),
-    ])
-    out = pipe.apply(rp.SpectralContainer(spot2d, wn)).spectral_data
-    return np.asarray(out, dtype=np.float32)
+# -----------------------------------------------------------------------------
+#  Whitaker-Hayes despiking -- local, bug-fixed reimplementation
+# -----------------------------------------------------------------------------
+#  Self-contained Whitaker-Hayes despiker (no external Raman library needed).
+#  RamanSPy 0.2.10's version has three bugs (its open issue #19): it divides by
+#  zero on flat regions (NaN/inf z-scores), misaligns the spike mask by one
+#  because np.diff shortens the array, and never inspects or repairs the final
+#  channel.  This implementation fixes all three.
+def _wh_modified_z_score(values):
+    """Modified z-scores; zeros (not NaN/inf) when the MAD is zero."""
+    median = np.median(values)
+    mad = np.median(np.abs(values - median))
+    if mad == 0:
+        return np.zeros_like(values, dtype=float)
+    return 0.6745 * (values - median) / mad
 
 
-def _savgol_spot(spot2d, *, wn):
-    pipe = rp.preprocessing.Pipeline([
-        rp.preprocessing.denoise.SavGol(window_length=21, polyorder=5),
-    ])
-    out = pipe.apply(rp.SpectralContainer(spot2d, wn)).spectral_data
-    return np.asarray(out, dtype=np.float32)
+def _wh_spike_mask(spectrum, threshold):
+    """Boolean spike mask aligned to `spectrum` (length n, endpoints inspected)."""
+    scores = np.abs(_wh_modified_z_score(np.diff(spectrum)))
+    # np.diff yields n-1 scores; scores[j] measures the jump spectrum[j+1] -
+    # spectrum[j], so after prepending, score i maps to the left-hand jump into
+    # spectrum[i].  Repeat the first score for the boundary (NOT the global max):
+    # forcing the boundary to scores.max() made channel 0 exceed the threshold
+    # whenever ANY spike existed in the frame, so the low-wavenumber edge was
+    # overwritten in every despiked spectrum.  Repeating scores[0] still inspects
+    # channel 0 on its own gradient -- a genuine edge spike makes diff[0] large,
+    # so it is still caught -- without flagging it because of a distant spike.
+    scores = np.insert(scores, 0, scores[0] if scores.size else 0.0)
+    return scores > threshold
+
+
+def _wh_despike_spectrum(spectrum, kernel_size, threshold):
+    """Despike ONE spectrum, replacing spikes by the mean of clean neighbours."""
+    out = np.array(spectrum, dtype=float, copy=True)
+    spikes = _wh_spike_mask(out, threshold)
+    while spikes.any():
+        changed = False
+        for i in np.flatnonzero(spikes):
+            # +1 in the upper bound so the final channel is a valid neighbour.
+            neighbours = np.arange(max(0, i - kernel_size),
+                                   min(len(out), i + 1 + kernel_size))
+            clean = neighbours[spikes[neighbours] == 0]
+            if clean.size == 0:
+                continue  # no clean neighbour yet; revisit on a later pass
+            value = np.mean(out[clean])
+            if np.isnan(value):
+                continue
+            out[i] = value
+            spikes[i] = False
+            changed = True
+        if not changed:
+            break
+    return out
+
+
+def _whitaker_hayes_despike_2d(spot2d, kernel_size=3, threshold=6.0):
+    """Apply the bug-fixed despiker to each frame of a (n_frames, n_wn) array."""
+    return np.apply_along_axis(
+        _wh_despike_spectrum, -1, spot2d,
+        kernel_size=kernel_size, threshold=threshold).astype(np.float32)
+
+
+def _despike_spot(spot2d, *, kernel_size=3, threshold=6.0):
+    return _whitaker_hayes_despike_2d(spot2d, kernel_size=kernel_size,
+                                      threshold=threshold)
+
+
+def _savgol_spot(spot2d, *, window_length=21, polyorder=5):
+    return savgol_filter(spot2d, window_length=window_length,
+                         polyorder=polyorder, axis=-1).astype(np.float32)
 
 
 def _baseline_spot(spot2d, *, use_spline, auto_lambda):
@@ -179,18 +246,80 @@ def _baseline_spot(spot2d, *, use_spline, auto_lambda):
     return bl, (spot2d - bl).astype(np.float32)
 
 
-def _fit_spot(packed, *, wn, search_min, search_max, model, fit_mode):
-    """Fit one spot; returns (result_dict, averaged_spectrum, lo_env, hi_env).
+def aggregate_centers(centers, method='trimmed', trim_fraction=0.2):
+    """Combine per-frame peak centers into one estimate + uncertainty.
+
+    Returns (center, center_err, n) where `n` is the number of finite centers
+    used.  `center_err` is NaN when it cannot be estimated (fewer than two
+    centers); callers fall back to the averaged fit's covariance error then.
+
+    method:
+      'mean'     arithmetic mean, SEM = std/sqrt(n).  Minimum-variance / ML
+                 estimator, but optimal only for clean, outlier-free Gaussian
+                 scatter -- a single bad frame drags it off.
+      'median'   robust to outliers and SERS blinking; err is the asymptotic
+                 standard error of the median (1.2533 * MAD_std / sqrt(n)).
+      'trimmed'  symmetric trimmed mean dropping `trim_fraction` of each tail.
+                 Rejects outliers while keeping most of the mean's efficiency;
+                 err uses the Winsorized (Tukey-McLaughlin) trimmed SEM.
+    """
+    c = np.asarray(centers, dtype=float)
+    c = c[np.isfinite(c)]
+    n = c.size
+    if n == 0:
+        return float('nan'), float('nan'), 0
+    if n == 1:
+        return float(c[0]), float('nan'), 1
+
+    if method == 'mean':
+        return float(np.mean(c)), float(np.std(c, ddof=1) / np.sqrt(n)), n
+
+    if method == 'median':
+        center = float(np.median(c))
+        mad = np.median(np.abs(c - center))
+        robust_sd = 1.4826 * mad                 # MAD -> Gaussian-consistent std
+        return center, float(1.2533 * robust_sd / np.sqrt(n)), n
+
+    # 'trimmed'
+    g = int(np.floor(trim_fraction * n))         # points cut from each tail
+    s = np.sort(c)
+    if g == 0:                                   # too few frames to trim
+        return float(np.mean(c)), float(np.std(c, ddof=1) / np.sqrt(n)), n
+    if 2 * g >= n:                               # would trim everything
+        center = float(np.median(c))
+        mad = np.median(np.abs(c - center))
+        return center, float(1.2533 * 1.4826 * mad / np.sqrt(n)), n
+    center = float(np.mean(s[g:n - g]))
+    # Winsorize the trimmed tails, then the Tukey-McLaughlin trimmed SEM.
+    w = s.copy()
+    w[:g] = s[g]
+    w[n - g:] = s[n - g - 1]
+    sw = np.std(w, ddof=1)
+    gamma = g / n
+    return center, float(sw / ((1.0 - 2.0 * gamma) * np.sqrt(n))), n
+
+
+def _fit_spot(packed, *, wn, search_min, search_max, model, fit_mode,
+              center_agg='trimmed', trim_fraction=0.2):
+    """Fit one spot; returns
+    (result_dict, averaged_spectrum, lo_env, hi_env, lo_keep, hi_keep).
 
     `packed` is (spot_index, spot_2d, noise_2sigma) to keep map() single-arg.
     `lo_env`/`hi_env` are the per-wavenumber min/max across the spot's frames
-    (the 77 map positions), so a plot can show how consistent the positions are
-    around the average as a shaded min-max band.
+    (or map positions); `lo_keep`/`hi_keep` are the central percentile band
+    a trimmed aggregator keeps (the [trim_fraction, 1-trim_fraction] quantiles
+    at each wavenumber), so a plot can shade the ignored tails separately from
+    the retained core.
     """
     i, spot2d, noise_i = packed
     avg_spec = np.mean(spot2d, axis=0)
     lo_env = np.min(spot2d, axis=0)   # quietest position at each wavenumber
     hi_env = np.max(spot2d, axis=0)   # loudest position at each wavenumber
+    # Per-wavenumber band a trimmed aggregator keeps vs. ignores: the central
+    # (1 - 2*trim_fraction) of positions at each wavenumber.
+    q = 100.0 * trim_fraction
+    lo_keep = np.percentile(spot2d, q, axis=0)
+    hi_keep = np.percentile(spot2d, 100.0 - q, axis=0)
     n = spot2d.shape[0]
     gate_avg = noise_i / np.sqrt(n)   # averaging cuts noise by sqrt(N)
 
@@ -205,24 +334,27 @@ def _fit_spot(packed, *, wn, search_min, search_max, model, fit_mode):
         centers = [f['center'] for f in per if f['success'] and f['above_noise']]
         res = dict(favg)  # shape/area/R2/QA curve from the averaged fit
         if centers:
-            k = len(centers)
-            res['center'] = float(np.mean(centers))
-            res['center_err'] = (float(np.std(centers, ddof=1) / np.sqrt(k))
-                                 if k > 1 else favg['center_err'])
+            center, cerr, k = aggregate_centers(
+                centers, method=center_agg, trim_fraction=trim_fraction)
+            res['center'] = center
+            res['center_err'] = cerr if np.isfinite(cerr) else favg['center_err']
             res['above_noise'] = True
             res['n_frames_fit'] = k
+            res['center_agg'] = center_agg
             # Per-frame centers are valid even if the averaged fit failed, so
             # mark the spot successful when any frame fit converged.
             res['success'] = True
         else:
             res['n_frames_fit'] = 0
+            res['center_agg'] = center_agg
             res['success'] = favg['success']
     else:
         res = dict(favg)
         res['n_frames_fit'] = n if favg['success'] else 0
+        res['center_agg'] = 'average'
 
     res.update(spot=i)
-    return res, avg_spec, lo_env, hi_env
+    return res, avg_spec, lo_env, hi_env, lo_keep, hi_keep
 
 
 # -----------------------------------------------------------------------------
@@ -385,10 +517,23 @@ def parse_args():
                    help='Lower wavenumber bound for peak search (cm^-1).')
     p.add_argument('--peak-max', type=float, default=None,
                    help='Upper wavenumber bound for peak search (cm^-1).')
-    p.add_argument('--fit-mode', default='average',
+    p.add_argument('--fit-mode', default='perframe',
                    choices=['average', 'perframe'],
-                   help='average (default): fit the per-spot averaged spectrum. '
-                        'perframe: fit every frame, report center as mean +/- SEM.')
+                   help='perframe (default, most accurate): fit every frame and '
+                        'combine the per-frame centers with --center-agg, taking '
+                        'shape/area/R2 from the averaged spectrum. average: fit '
+                        'only the per-spot averaged spectrum (faster, center from '
+                        'one fit).')
+    p.add_argument('--center-agg', default='trimmed',
+                   choices=['mean', 'median', 'trimmed'],
+                   help='How to combine per-frame centers in --fit-mode perframe '
+                        '(default: trimmed). trimmed: symmetric trimmed mean -- '
+                        'rejects outliers while keeping most of the efficiency; '
+                        'median: most robust; mean: plain mean +/- SEM (optimal '
+                        'only when there are no outlier frames).')
+    p.add_argument('--trim-fraction', type=float, default=0.2,
+                   help='Fraction trimmed from each tail when --center-agg trimmed '
+                        '(default: 0.2 = 20%% per tail). Ignored otherwise.')
     p.add_argument('--smooth-before-fit', action='store_true',
                    help='Apply Savitzky-Golay before fitting (legacy behavior). '
                         'Off by default: fitting smoothed data biases width/R2.')
@@ -419,6 +564,10 @@ def main():
     setup_rcparams()
     show = not args.no_qa_plots
     label = args.label
+
+    if not 0.0 <= args.trim_fraction < 0.5:
+        raise SystemExit(f"--trim-fraction must be in [0, 0.5); got "
+                         f"{args.trim_fraction}.")
 
     # --- Read ----------------------------------------------------------------
     wn, spectra_raw, files = load_spots(args.path, resample=not args.strict_axis)
@@ -470,23 +619,18 @@ def main():
     print(f"  Processing start: {proc_start_wall:%Y-%m-%d %H:%M:%S}")
 
     # --- Despike (always) + Savitzky-Golay (QA / optional pre-fit) -----------
-    # threshold=6.0 is stricter than RamanSPy's default of 8, which better
-    # preserves weak SERS bands while still catching cosmic rays.
-    savgol = rp.preprocessing.Pipeline([
-        rp.preprocessing.denoise.SavGol(window_length=21, polyorder=5),
-    ])
-
-    def apply_pipe(pipe, data2d):
-        return pipe.apply(rp.SpectralContainer(data2d, wn)).spectral_data
+    # threshold=6.0 is more sensitive than the Whitaker-Hayes default of 8: the
+    # lower cutoff flags fainter cosmic-ray spikes.  Genuine SERS bands survive
+    # because they are broad -- their point-to-point differences stay well below
+    # the z-score cutoff, so only narrow (1-2 channel) spikes are removed.
 
     try:
         _t = time.perf_counter()
-        spectra_despiked = run_parallel(
-            functools.partial(_despike_spot, wn=wn), spectra_raw, executor)
+        spectra_despiked = run_parallel(_despike_spot, spectra_raw, executor)
         stage_times.append(('despike', time.perf_counter() - _t))
 
         # Smoothed view of the QA spot for the raw-vs-smoothed comparison.
-        qa_smoothed = apply_pipe(savgol, spectra_despiked[qa_i]).astype(np.float32)
+        qa_smoothed = _savgol_spot(spectra_despiked[qa_i])
         qa_plot(wn,
                 [(spectra_raw[qa_i][qa_j], 'Raw'), (qa_smoothed[qa_j], 'Smoothed')],
                 f'Plot 2: Raw vs smoothed spectrum (spot {qa_i}, frame {qa_j})',
@@ -495,8 +639,7 @@ def main():
         # Fit input: despiked-but-unsmoothed by default; SavGol only if requested.
         if args.smooth_before_fit:
             _t = time.perf_counter()
-            fit_input = run_parallel(
-                functools.partial(_savgol_spot, wn=wn), spectra_despiked, executor)
+            fit_input = run_parallel(_savgol_spot, spectra_despiked, executor)
             stage_times.append(('smooth', time.perf_counter() - _t))
         else:
             fit_input = spectra_despiked
@@ -569,7 +712,8 @@ def main():
         fit_out = run_parallel(
             functools.partial(_fit_spot, wn=wn, search_min=search_min,
                               search_max=search_max, model=args.model,
-                              fit_mode=args.fit_mode),
+                              fit_mode=args.fit_mode, center_agg=args.center_agg,
+                              trim_fraction=args.trim_fraction),
             list(zip(range(len(spectra_b)), spectra_b, noise_2sigma)),
             executor)
         stage_times.append(('fit', time.perf_counter() - _t))
@@ -589,12 +733,13 @@ def main():
     # Worker output arrives in spot order, so the CSV row order and the per-spot
     # QA figures match the original serial behavior.
     results = []
-    qa_fits = []  # (spot, avg, lo_env, hi_env, result) per successful spot
-    for res, avg_spec, lo_env, hi_env in fit_out:
+    qa_fits = []  # (spot, avg, lo_env, hi_env, lo_keep, hi_keep, result) per spot
+    for res, avg_spec, lo_env, hi_env, lo_keep, hi_keep in fit_out:
         res['file'] = files[res['spot']]
         results.append(res)
         if res['success'] and res.get('x_fit') is not None:
-            qa_fits.append((res['spot'], avg_spec, lo_env, hi_env, res))
+            qa_fits.append((res['spot'], avg_spec, lo_env, hi_env,
+                            lo_keep, hi_keep, res))
 
     del fit_out, spectra_b  # largest arrays, no longer needed after fitting
 
@@ -617,7 +762,7 @@ def main():
     csv_path = f'peak_fits_{label}.csv'
     fieldnames = ['spot', 'file', 'center', 'center_err', 'fwhm', 'height',
                   'area', 'r_squared', 'aic', 'bic', 'n_frames_fit',
-                  'above_noise', 'model', 'success']
+                  'center_agg', 'above_noise', 'model', 'success']
     with open(csv_path, 'w', newline='') as fh:
         writer = csv.DictWriter(fh, fieldnames=fieldnames, extrasaction='ignore')
         writer.writeheader()
@@ -631,14 +776,26 @@ def main():
     # appear at once instead of blocking one-at-a-time on each plt.show().
     mask = (wn >= search_min) & (wn <= search_max)
     qa_figs = []
-    for qa_spot, qa_spec, qa_lo, qa_hi, r_qa in qa_fits:
+    for qa_spot, qa_spec, qa_lo, qa_hi, qa_klo, qa_khi, r_qa in qa_fits:
         fig, ax = plt.subplots(figsize=(7, 4.5))
-        # Min-max envelope across the spot's positions: a wide band means the
-        # positions disagree, a tight band means the average is representative.
-        ax.fill_between(wn[mask], qa_lo[mask], qa_hi[mask],
-                        color='steelblue', alpha=0.20,
-                        label='Min-max across positions')
-        ax.plot(wn[mask], qa_spec[mask], label='Averaged spectrum')
+        # Spread of the positions around the average.  When the center was
+        # aggregated with a trimmed mean, split the band: a lighter outer band
+        # for the tails the trim ignores and a darker inner band for the
+        # central positions it keeps.
+        if r_qa.get('center_agg') == 'trimmed':
+            pct = int(round(100.0 * (1.0 - 2.0 * args.trim_fraction)))
+            ax.fill_between(wn[mask], qa_lo[mask], qa_hi[mask],
+                            color='steelblue', alpha=0.12,
+                            label='Positions ignored (trimmed tails)')
+            ax.fill_between(wn[mask], qa_klo[mask], qa_khi[mask],
+                            color='steelblue', alpha=0.30,
+                            label=f'Central {pct}% retained')
+        else:
+            ax.fill_between(wn[mask], qa_lo[mask], qa_hi[mask],
+                            color='steelblue', alpha=0.20,
+                            label='Min-max across positions')
+        ax.plot(wn[mask], qa_spec[mask],
+                label='Averaged spectrum (all positions)')
         ax.plot(r_qa['x_fit'], r_qa['y_fit'], '--',
                 label=f"Fitted {r_qa['model']}  R$^2$={r_qa['r_squared']:.4f}")
         ax.axvline(r_qa['center'], color='gray', linestyle=':',
