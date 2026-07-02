@@ -1,6 +1,6 @@
 RamanPeakShiftAnalyzer
 
-Automated Raman/SERS spectroscopy analysis pipeline for processing Renishaw time-series measurements, extracting Raman peak characteristics, and tracking peak-frequency shifts across experimental conditions.
+Automated Raman/SERS spectroscopy analysis pipeline for processing Renishaw time-series and map measurements, extracting Raman peak characteristics, and tracking peak-frequency shifts across experimental conditions.
 
 Overview
 
@@ -17,7 +17,7 @@ Parallel execution for large datasets
 Publication-quality quality-assurance visualizations
 Features
 Data Import
-Reads Renishaw ASCII time-series exports
+Reads Renishaw ASCII time-series and map exports (dispatched by column layout; map positions are treated as frames)
 Validates file structure and spectral consistency
 Automatically aligns spectra to a common wavenumber axis
 Optional strict axis validation mode
@@ -62,7 +62,7 @@ Maximizes signal-to-noise ratio
 Per-Frame Mode
 
 Fits every frame individually
-Reports mean peak position and standard error
+Combines the per-frame centers with a robust estimator (trimmed mean by default; mean or median also available), reporting the aggregated center and its standard error
 Preserves temporal variability such as SERS blinking behavior
 Performance
 Optional multiprocessing support
@@ -122,7 +122,7 @@ Installation
 
 Required packages:
 
-pip install numpy matplotlib pybaselines ramanspy lmfit
+pip install numpy scipy matplotlib pybaselines lmfit
 
 Clone the repository:
 
@@ -130,7 +130,7 @@ git clone https://github.com/yourusername/RamanPeakShiftAnalyzer.git
 cd RamanPeakShiftAnalyzer
 Usage
 
-Process a directory of Renishaw time-series exports:
+Process a directory of Renishaw exports (time-series or map):
 
 python run.py path_to_data
 
@@ -168,6 +168,9 @@ peak_centers_*.png
 
 spectra_treatment_*.png
     Quality assurance figures
+
+fit_qa_*.png
+    Per-spot fit-quality figures
 Software Engineering Highlights
 
 This project demonstrates:
